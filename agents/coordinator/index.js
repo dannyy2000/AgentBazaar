@@ -1,13 +1,13 @@
 import "dotenv/config";
 import express from "express";
-import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
 import axios from "axios";
 import { sendPayment, getBalance } from "../../shared/stellar.js";
 
 const app = express();
 app.use(express.json());
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const PORT = process.env.COORDINATOR_PORT || 3000;
 const COORDINATOR_SECRET = process.env.COORDINATOR_SECRET_KEY;
@@ -40,7 +40,6 @@ const AGENT_REGISTRY = {
   },
 };
 
-// Pay an agent via Stellar and call its endpoint with the tx hash (x402)
 async function callAgent(agentKey, body) {
   const agent = AGENT_REGISTRY[agentKey];
   if (!agent) throw new Error(`Unknown agent: ${agentKey}`);
@@ -69,61 +68,53 @@ async function callAgent(agentKey, body) {
   return { result: response.data.result, txHash };
 }
 
-// Tool definitions — Claude Sonnet uses these to decide which agents to hire
 const tools = [
   {
-    name: "call_researcher",
-    description: AGENT_REGISTRY.researcher.description,
-    input_schema: {
-      type: "object",
-      properties: {
-        task: {
-          type: "string",
-          description: "The specific research task to perform",
+    type: "function",
+    function: {
+      name: "call_researcher",
+      description: AGENT_REGISTRY.researcher.description,
+      parameters: {
+        type: "object",
+        properties: {
+          task: { type: "string", description: "The specific research task" },
         },
+        required: ["task"],
       },
-      required: ["task"],
     },
   },
   {
-    name: "call_analyst",
-    description: AGENT_REGISTRY.analyst.description,
-    input_schema: {
-      type: "object",
-      properties: {
-        task: {
-          type: "string",
-          description: "The analysis task to perform",
+    type: "function",
+    function: {
+      name: "call_analyst",
+      description: AGENT_REGISTRY.analyst.description,
+      parameters: {
+        type: "object",
+        properties: {
+          task: { type: "string", description: "The analysis task" },
+          data: { type: "string", description: "The research data to analyze" },
         },
-        data: {
-          type: "string",
-          description: "The research data or text to analyze",
-        },
+        required: ["task", "data"],
       },
-      required: ["task", "data"],
     },
   },
   {
-    name: "call_writer",
-    description: AGENT_REGISTRY.writer.description,
-    input_schema: {
-      type: "object",
-      properties: {
-        task: {
-          type: "string",
-          description: "The writing task to perform",
+    type: "function",
+    function: {
+      name: "call_writer",
+      description: AGENT_REGISTRY.writer.description,
+      parameters: {
+        type: "object",
+        properties: {
+          task: { type: "string", description: "The writing task" },
+          context: { type: "string", description: "All research and analysis to base the writing on" },
         },
-        context: {
-          type: "string",
-          description: "All research and analysis to base the writing on",
-        },
+        required: ["task", "context"],
       },
-      required: ["task", "context"],
     },
   },
 ];
 
-// Health check
 app.get("/health", async (req, res) => {
   const balance = await getBalance(COORDINATOR_PUBLIC);
   res.json({
@@ -135,110 +126,94 @@ app.get("/health", async (req, res) => {
   });
 });
 
-// List all available agents (mirrors the Soroban registry)
 app.get("/agents", (req, res) => {
   res.json({ agents: AGENT_REGISTRY });
 });
 
-// Main task endpoint
 app.post("/task", async (req, res) => {
   const { task } = req.body;
-
-  if (!task) {
-    return res.status(400).json({ error: "Missing task in request body" });
-  }
+  if (!task) return res.status(400).json({ error: "Missing task" });
 
   console.log(`\n${"=".repeat(60)}`);
   console.log(`[Coordinator] New task: ${task}`);
   console.log(`${"=".repeat(60)}`);
 
-  const messages = [{ role: "user", content: task }];
+  const messages = [
+    {
+      role: "system",
+      content: `You are the Coordinator Agent in AgentBazaar — an autonomous marketplace where AI agents hire and pay other agents to complete tasks on Stellar.
+
+You have three specialized agents you can hire:
+- call_researcher: gathers information and research on any topic
+- call_analyst: analyzes data and extracts deep insights
+- call_writer: synthesizes everything into a polished final report
+
+For each task:
+1. Always call call_researcher first to gather information
+2. Call call_analyst with the research findings for deep insights
+3. Call call_writer with all context to produce the final report
+4. Return the writer's output as your final answer
+
+Each tool call triggers a real Stellar XLM payment to that agent. Be decisive and efficient.`,
+    },
+    { role: "user", content: task },
+  ];
+
   const paymentLog = [];
 
   try {
-    // Agentic loop — Claude decides which agents to hire and in what order
     while (true) {
-      const response = await client.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4096,
-        system: `You are the Coordinator Agent in AgentBazaar — an autonomous marketplace where AI agents hire and pay other agents to complete tasks.
-
-You have access to three specialized agents you can hire:
-- call_researcher: for gathering information and research
-- call_analyst: for analyzing data and extracting insights
-- call_writer: for synthesizing everything into a final polished report
-
-For each user task, you must:
-1. Decide which agents are needed and in what order
-2. Call them using the tools (each call triggers a real Stellar XLM payment)
-3. Pass relevant context between agents (research findings to analyst, everything to writer)
-4. After all agents have responded, synthesize a final answer
-
-Always use at least the researcher and writer. Use the analyst when the task requires deep insight or pattern recognition.
-Be decisive — plan and execute efficiently.`,
-        tools,
+      const response = await client.chat.completions.create({
+        model: "gpt-4o",
         messages,
+        tools,
+        tool_choice: "auto",
       });
 
-      if (response.stop_reason === "end_turn") {
-        const finalText =
-          response.content.find((b) => b.type === "text")?.text || "";
+      const message = response.choices[0].message;
+      messages.push(message);
 
-        console.log(`\n[Coordinator] Task complete.`);
-        console.log(
-          `[Coordinator] Total payments made: ${paymentLog.length} transactions`
-        );
-
+      if (!message.tool_calls || message.tool_calls.length === 0) {
+        console.log(`\n[Coordinator] Task complete. ${paymentLog.length} payments made.`);
         return res.json({
-          result: finalText,
+          result: message.content,
           payments: paymentLog,
-          totalSpent: `${paymentLog
-            .reduce((sum, p) => sum + parseFloat(p.amount), 0)
-            .toFixed(1)} XLM`,
+          totalSpent: `${paymentLog.reduce((sum, p) => sum + parseFloat(p.amount), 0).toFixed(1)} XLM`,
         });
       }
 
-      if (response.stop_reason === "tool_use") {
-        messages.push({ role: "assistant", content: response.content });
+      for (const toolCall of message.tool_calls) {
+        const name = toolCall.function.name;
+        const input = JSON.parse(toolCall.function.arguments);
 
-        const toolResults = [];
+        let agentKey;
+        let body;
 
-        for (const block of response.content) {
-          if (block.type !== "tool_use") continue;
-
-          let agentKey;
-          let body;
-
-          if (block.name === "call_researcher") {
-            agentKey = "researcher";
-            body = { task: block.input.task };
-          } else if (block.name === "call_analyst") {
-            agentKey = "analyst";
-            body = { task: block.input.task, data: block.input.data };
-          } else if (block.name === "call_writer") {
-            agentKey = "writer";
-            body = { task: block.input.task, context: block.input.context };
-          }
-
-          const { result, txHash } = await callAgent(agentKey, body);
-
-          paymentLog.push({
-            agent: agentKey,
-            amount: AGENT_REGISTRY[agentKey].price,
-            txHash,
-            stellarExplorer: `https://stellar.expert/explorer/testnet/tx/${txHash}`,
-          });
-
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: block.id,
-            content: result,
-          });
+        if (name === "call_researcher") {
+          agentKey = "researcher";
+          body = { task: input.task };
+        } else if (name === "call_analyst") {
+          agentKey = "analyst";
+          body = { task: input.task, data: input.data };
+        } else if (name === "call_writer") {
+          agentKey = "writer";
+          body = { task: input.task, context: input.context };
         }
 
-        messages.push({ role: "user", content: toolResults });
-      } else {
-        break;
+        const { result, txHash } = await callAgent(agentKey, body);
+
+        paymentLog.push({
+          agent: agentKey,
+          amount: AGENT_REGISTRY[agentKey].price,
+          txHash,
+          stellarExplorer: `https://stellar.expert/explorer/testnet/tx/${txHash}`,
+        });
+
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: result,
+        });
       }
     }
   } catch (err) {
